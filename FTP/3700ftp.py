@@ -1,0 +1,279 @@
+import socket
+import os
+import sys
+from urllib.parse import urlparse
+
+class FTPClient:
+    root_folder = 'ftp://lyuyun@ftp.3700.network'
+    defaultPath = 'ftp://lyuyun:rIU5VA3fsPTMR91CXWcm@ftp.3700.network'
+
+    ## constructor for FTP Client, with a default host, port, user, and password
+    ## host : String
+    ## port : int
+    ## user : String
+    ## password : String 
+    ## control_socket : socket -- to be initialized 
+    ## data_socket L socket -- to be initialized
+    def __init__(self, host, user, password, port=21):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.control_socket = None
+        self.data_socket = None
+    @staticmethod
+    def extract_credentials(url):
+        parsed_url = urlparse(url)
+        # Extracting user, password, host, and port
+        user = parsed_url.username
+        password = parsed_url.password
+        host = parsed_url.hostname
+        port = parsed_url.port if parsed_url.port else 21 
+
+        return {
+            "user": user,
+            "password": password,
+            "host": host,
+            "port": port
+        }
+    ## parse url
+    def parse_url(self, url):
+        # If the scheme is 'ftp' and there's no dot in the netloc, 
+        # consider netloc as part of the path
+        parsed_url = urlparse(url)
+        if parsed_url.scheme == 'ftp' and '.' not in parsed_url.netloc:
+            path = parsed_url.netloc + parsed_url.path
+        else:
+            path = parsed_url.path
+        # Remove the leading '/' from the path
+        return path[1:] if path.startswith('/') else path
+
+    
+    ## function to connect the control socket to the ftp server
+    def connect(self):
+        self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.control_socket.connect((self.host, self.port))
+        # Read the welcome message
+        print(self.control_socket.recv(1024).decode())
+    
+    ## login function to login with provided or default username and password
+    ## return : none
+    def login(self):
+        self.send_command(f'USER {self.user}')
+        self.send_command(f'PASS {self.password}')
+
+    ## send any command in the format that ftp server accepts 
+    ## command : String -- message to be sent to ftp server
+    ## return : String -- respond 
+    def send_command(self, command):
+        self.control_socket.sendall((command + '\r\n').encode())
+        response = self.control_socket.recv(1024).decode()
+        print('from control socket:' + response)
+        return response
+    
+    # Handle PASV command and establish data channel
+    def pasv(self):
+        self.send_command(f'TYPE I')
+        self.send_command(f'MODE S')
+        self.send_command(f'STRU F')
+        response = self.send_command('PASV')
+        ## get start and end index to parse IP address
+        start = response.find('(')
+        end = response.find(')')
+        ## error if pasv fails to start 
+        if '227' not in response:
+            raise Exception("Failed to enter passive mode.")       
+        ip_num = list(map(int, response[start+1:end].split(',')))
+        ip_address = '.'.join(map(str, ip_num[:4]))
+        port = (int(ip_num[4]) << 8) + int(ip_num[5])
+    
+        # Establish the data connection
+        self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.data_socket.settimeout(10)
+        self.data_socket.connect((ip_address, port))
+    
+    # Handle ls command 
+    def ls(self, path):
+        dir = self.parse_url(path)
+        self.pasv()    
+        self.send_command(f'LIST {dir}')
+        message = self.data_socket.recv(4096).decode()
+        print('from data socket:' + message)
+        message2 = self.control_socket.recv(1024).decode()
+        print('from control socket:' + message2)
+
+    # Handle rm command
+    def rm(self, path):
+        dir = self.parse_url(path)
+        self.send_command(f'DELE {dir}')
+
+    # Handle mkdir command
+    def mkdir(self, path):   
+        dir = self.parse_url(path)
+        self.send_command(f'MKD {dir}')
+
+    # Handle rmdir command
+    def rmdir(self, path):
+        dir = self.parse_url(path)
+        self.send_command(f'RMD {dir}')
+
+    # Remove an non-empty directory 
+    # ls given directory and then delete all files/directories in it, then remove the given directory 
+    def rmNEdir(self, path):
+        response = self.ls(path)
+        files = response.parse
+        self.rmdir(path)
+        
+
+    # Handle cp command, upload from local to server
+    def upload(self, local, server):
+        self.pasv()
+        dir = self.parse_url(server) 
+        with open(local, 'rb') as file:
+            self.send_command(f'STOR {dir}')
+            while True:
+                data = file.read(4096)
+                if not data:
+                    break
+                self.data_socket.sendall(data)
+            self.data_socket.close()
+    
+    # Handle cp command, download from server to local
+    def download(self, local, server):
+        self.pasv()
+        dir = self.parse_url(server)
+        with open(local, 'wb') as file:
+            self.send_command(f'RETR {dir}')
+            while True:
+                data = self.data_socket.recv(4096)
+                if not data:
+                    break
+                file.write(data)
+        self.data_socket.close()
+
+    # quit FTP server
+    def close(self):
+        self.send_command('QUIT')
+        self.control_socket.close()
+        
+
+def main(argv):
+    serverURL = ''
+    localURL = ''
+    ##  Read commandline arguments, keep position by i
+    i = 0
+    while i < len(argv):
+        if i < len(argv) and argv[i] == 'ls':
+            #read next argument
+            i+=1
+            serverURL = argv[i]
+            credentials = FTPClient.extract_credentials(serverURL)
+            client = FTPClient(**credentials)
+            client.connect()
+            client.login()
+            client.ls(serverURL)
+            break
+        if i < len(argv) and argv[i] == 'mkdir':
+            #read next argument
+            i+=1
+            serverURL = argv[i]
+            credentials = FTPClient.extract_credentials(serverURL)
+            client = FTPClient(**credentials)
+            client.connect()
+            client.login()
+            client.mkdir(serverURL)
+            break
+        if i < len(argv) and argv[i] == 'rm':
+            #read next argument
+            i+=1
+            serverURL = argv[i]
+            credentials = FTPClient.extract_credentials(serverURL)
+            client = FTPClient(**credentials)
+            client.connect()
+            client.login()
+            client.rm(serverURL)
+            break
+        if i < len(argv) and argv[i] == 'rmdir':
+            #read next argument
+            i+=1
+            serverURL = argv[i]
+            credentials = FTPClient.extract_credentials(serverURL)
+            client = FTPClient(**credentials)
+            client.connect()
+            client.login()
+            client.rmdir(serverURL)
+            break
+        if i < len(argv) and argv[i] == 'cp':
+            #read next argument
+            i+=1
+            ## determine if the first url is server url
+            if ':' in argv[i] :
+                serverURL = argv[i]
+                credentials = FTPClient.extract_credentials(serverURL)
+                client = FTPClient(**credentials) 
+                client.connect()
+                client.login()
+                i+=1
+                ## cp from server to server not allowed 
+                if ':' in argv[i]:
+                    raise Exception("url must be one local and one server")
+                localURL = argv[i]
+                client.download(localURL, serverURL)
+                break
+            else:
+                localURL = argv[i]
+                i+=1
+                ## cp from local to local not allowed 
+                if ':' not in argv[i]:
+                    raise Exception("url must be one local and one server")
+                serverURL = argv[i]
+                credentials = FTPClient.extract_credentials(serverURL)
+                client = FTPClient(**credentials)
+                client.connect()
+                client.login()
+                client.upload(localURL, serverURL)
+                break
+        if i < len(argv) and argv[i] == 'mv':
+            i+=1
+            ## determine if first url is server url
+            if ':' in argv[i] :
+                serverURL = argv[i]
+                credentials = FTPClient.extract_credentials(serverURL)
+                client = FTPClient(**credentials) 
+                client.connect()
+                client.login()
+                i+=1
+                localURL = argv[i]
+                #determine if second url is server url
+                if ':' in argv[i]:
+                    #mv from server to server not allowed
+                    raise Exception("url must be one local and one server")
+                # mv from server to local
+                client.download(localURL, serverURL)
+                client.rm(serverURL)
+                break
+            else:
+                localURL = argv[i]
+                i+=1
+                if ':' not in argv[i]:
+                    # move from local to local not allowed
+                    raise Exception("url must be one local and one server")
+                serverURL = argv[i]
+                credentials = FTPClient.extract_credentials(serverURL)
+                client = FTPClient(**credentials) 
+                client.connect()
+                client.login()
+                # mv from local to server
+                client.upload(localURL, serverURL)
+                if os.path.exists(localURL):
+                    os.remove(localURL)
+                break
+        else: 
+            raise Exception('please enter valid command')
+    
+    ## quit program 
+    client.close()
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])

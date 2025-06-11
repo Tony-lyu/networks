@@ -1,0 +1,308 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+    routing_table = {}
+    revoked_routes = []
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    def handle_message(self, msg, srcif):
+        msg_type = msg["type"]
+        if msg_type == "update":
+            self.update_message(msg, srcif)
+        elif msg_type == "withdraw":
+            self.withdraw_message(msg, srcif)
+        elif msg_type == "data":
+            self.data_message(msg, srcif)
+        elif msg_type == "dump":
+            self.dump_message(msg, srcif)
+
+    def update_message(self, msg, srcif):
+        # Loop prevention
+        if self.asn in msg["msg"]["ASPath"]:
+            return
+
+        existing_route = self.routing_table.get(msg["msg"]["network"])
+        self.aggregate_routes()
+        msg["msg"]["peer"] = srcif
+
+        # Check if the new route is better than the existing route
+        if self.is_better_route(msg["msg"], existing_route):
+            self.routing_table[msg["msg"]["network"]] = msg["msg"]
+            for neighbor in self.sockets:
+                if neighbor != srcif:
+                    self.update_neighbor(msg, neighbor)
+
+
+    def update_neighbor(self, msg, neighbor):
+        srcif = msg["msg"]["peer"]
+        src_relationship = self.relations[srcif]
+        neighbor_relationship = self.relations[neighbor]
+        # If the update is from a customer, forward to all neighbors
+        if src_relationship == 'cust':
+            self.forward_update(msg, neighbor)
+        # If the update is from a peer or provider, forward only to customers
+        elif src_relationship in ['peer', 'prov'] and neighbor_relationship == 'cust':
+            self.forward_update(msg, neighbor)
+
+    def forward_update(self, msg, neighbor):
+        forwarded_msg = {
+            "src": self.our_addr(neighbor),
+            "dst": neighbor,
+            "type": "update",
+            "msg": {
+                "network": msg["msg"]["network"],
+                "netmask": msg["msg"]["netmask"],
+                "ASPath": [self.asn] + msg["msg"]["ASPath"],
+            }
+        }
+        self.send(neighbor, json.dumps(forwarded_msg))
+
+    def withdraw_message(self, msg, srcif):
+            # to be withdraw
+            networks_to_withdraw = msg["msg"]
+
+            for network in networks_to_withdraw:
+                network_address = network["network"]
+                if network_address in self.routing_table:
+                    # Save a copy of the revocation
+                    self.revoked_routes.append(network)
+                    
+                    del self.routing_table[network_address]
+                    self.disaggregate_routes(network_address)
+
+                    # Send the revoke message to other neighboring routers
+                    for neighbor in self.sockets:
+                        if neighbor != srcif:
+                            self.send(neighbor, json.dumps({
+                                "type": "withdraw",
+                                "src": self.our_addr(neighbor),
+                                "dst": neighbor,
+                                "msg": [network]  
+                            }))
+
+                    # Check if there's a new route for the withdrawn network
+                    new_route = self.routing_table.get(network_address)
+                    if new_route:
+                        for neighbor in self.sockets:
+                            self.update_neighbor(new_route, neighbor)
+
+
+    def data_message(self, msg, srcif):
+        next = self.route(msg["dst"])
+        if next:
+            src_relationship = self.relations[srcif]
+            dst_relationship = self.relations[next]
+
+            # Check forwarding legality
+            if src_relationship in ['peer', 'prov'] and dst_relationship in ['peer', 'prov']:
+                self.no_route_message(msg, srcif)
+                return
+
+            self.send(next, json.dumps(msg))
+        else:
+            self.no_route_message(msg, srcif)
+
+
+    def no_route_message(self, msg, srcif):
+        error_msg = {
+        "src": self.our_addr(srcif),
+        "dst": msg["src"],
+        "type": "no route",
+        "msg": {}
+    }
+        self.send(srcif, json.dumps(error_msg))
+    
+    def dump_message(self, msg, srcif):
+        table_msg = {
+        "src": self.our_addr(srcif),
+        "dst": srcif,
+        "type": "table",
+        "msg": list(self.routing_table.values())
+    }
+        self.send(srcif, json.dumps(table_msg))
+
+    def aggregate_routes(self):
+        sorted_routes = sorted(self.routing_table.items(), key=lambda x: struct.unpack('!I', socket.inet_aton(x[0]))[0])
+        i = 0
+        while i < len(sorted_routes) - 1:
+            network1, route_info1 = sorted_routes[i]
+            network2, route_info2 = sorted_routes[i + 1]
+
+            # Check if the two routes can be aggregated
+            if self.can_aggregate(network1, route_info1["netmask"], network2, route_info2["netmask"], route_info1, route_info2):
+                # Aggregate the routes
+                new_netmask = self.decrease_netmask(route_info1["netmask"])
+                self.routing_table[network1] = {
+                    "network": network1,
+                    "netmask": new_netmask,
+                    "peer": route_info1["peer"],
+                    "localpref": route_info1["localpref"],
+                    "ASPath": route_info1["ASPath"],
+                    "selfOrigin": route_info1["selfOrigin"],
+                    "origin": route_info1["origin"]
+                }
+                # Remove the second route from the routing table
+                del self.routing_table[network2]
+                sorted_routes.pop(i + 1)
+            else:
+                i += 1
+
+    def decrease_netmask(self, netmask):
+        # Convert netmask to integer, decrease by 1 bit, and convert back to string
+        mask_int = struct.unpack('!I', socket.inet_aton(netmask))[0]
+        new_mask_int = mask_int << 1 & 0xFFFFFFFF
+        return socket.inet_ntoa(struct.pack('!I', new_mask_int))
+            
+    def can_aggregate(self, network1, netmask1, network2, netmask2, route_info1, route_info2):
+        # Check if the two routes are numerically adjacent and have the same attributes
+        if self.ip_in_network(network2, network1, self.decrease_netmask(netmask1)) and \
+        route_info1["peer"] == route_info2["peer"] and \
+        route_info1["localpref"] == route_info2["localpref"] and \
+        route_info1["ASPath"] == route_info2["ASPath"] and \
+        route_info1["selfOrigin"] == route_info2["selfOrigin"] and \
+        route_info1["origin"] == route_info2["origin"]:
+            return True
+        return False
+    
+    def disaggregate_routes(self, withdrawn_network):
+        # Check if the withdrawn network was part of an aggregated route
+        for network, route_info in self.routing_table.items():
+            if self.ip_in_network(withdrawn_network, network, route_info["netmask"]):
+                # If the netmask of the route in the routing table is larger than the withdrawn network's netmask, it's an aggregated route
+                if struct.unpack('!I', socket.inet_aton(route_info["netmask"]))[0] > struct.unpack('!I', socket.inet_aton(self.default_netmask(withdrawn_network)))[0]:
+                    # Disaggregate the route by splitting it into two
+                    new_netmask = self.increase_netmask(route_info["netmask"])
+                    new_network = self.next_network(network, new_netmask)
+                    
+                    # Add the new network to the routing table with the same route info
+                    self.routing_table[new_network] = route_info.copy()
+                    self.routing_table[new_network]["netmask"] = new_netmask
+                    
+                    # Update the original network's netmask
+                    self.routing_table[network]["netmask"] = new_netmask
+                break
+
+    def default_netmask(self, network):
+        return "255.255.255.0"
+
+    def next_network(self, network, netmask):
+        # Calculate the next network based on the given netmask
+        ip_int = struct.unpack('!I', socket.inet_aton(network))[0]
+        mask_int = struct.unpack('!I', socket.inet_aton(netmask))[0]
+        next_ip_int = ip_int + (~mask_int + 1)  # Add the number of hosts in the network to get the next network
+        return socket.inet_ntoa(struct.pack('!I', next_ip_int))
+
+    def increase_netmask(self, netmask):
+        # Convert netmask to integer, increase by 1 bit, and convert back to string
+        mask_int = struct.unpack('!I', socket.inet_aton(netmask))[0]
+        new_mask_int = mask_int >> 1 & 0xFFFFFFFF
+        return socket.inet_ntoa(struct.pack('!I', new_mask_int))
+
+    def route(self, dest):
+        best_match = None
+        longest_prefix = -1
+        best_route_info = None
+
+        for network, route_info in self.routing_table.items():
+            if self.ip_in_network(dest, network, route_info["netmask"]):
+                prefix_length = sum(bin(int(x)).count('1') for x in route_info["netmask"].split('.'))
+                if prefix_length > longest_prefix or (prefix_length == longest_prefix and self.is_better_route(route_info, best_route_info)):
+                    longest_prefix = prefix_length
+                    best_match = route_info["peer"]
+                    best_route_info = route_info
+
+        return best_match
+    
+    def is_better_route(self, new_route, current_best):
+        if not current_best:
+            return True
+
+        # 1. Compare localpref
+        new_localpref = new_route.get("localpref", 100)
+        current_localpref = current_best.get("localpref", 100)
+        if new_localpref > current_localpref:
+            return True
+        elif new_localpref == current_localpref:
+            
+            # 2. Compare ASPath length
+            if len(new_route["ASPath"]) < len(current_best["ASPath"]):
+                return True
+            elif len(new_route["ASPath"]) == len(current_best["ASPath"]):
+                
+                # 3. Compare origin
+                origin_priority = {"IGP": 3, "EGP": 2, "UNK": 1}
+                if origin_priority[new_route["origin"]] > origin_priority[current_best["origin"]]:
+                    return True
+                elif origin_priority[new_route["origin"]] == origin_priority[current_best["origin"]]:
+                    
+                    # 4. Compare IP address of the peer
+                    if self.compare_ip(new_route["peer"], current_best["peer"]) == -1:
+                        return True
+
+        return False
+
+    def compare_ip(self, ip1, ip2):
+        ip1_octets = [int(octet) for octet in ip1.split('.')]
+        ip2_octets = [int(octet) for octet in ip2.split('.')]
+        
+        for o1, o2 in zip(ip1_octets, ip2_octets):
+            if o1 < o2:
+                return -1
+            elif o1 > o2:
+                return 1
+        return 0
+    
+    def ip_in_network(self, dest, network, netmask):
+        ip_int = struct.unpack('!I', socket.inet_aton(dest))[0]
+        net_int = struct.unpack('!I', socket.inet_aton(network))[0]
+        mask_int = struct.unpack('!I', socket.inet_aton(netmask))[0]
+        return (ip_int & mask_int) == (net_int & mask_int)
+    
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = json.loads(k.decode('utf-8'))
+
+                print("Received message '%s' from %s" % (msg, srcif))
+                self.handle_message(msg, srcif)
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
