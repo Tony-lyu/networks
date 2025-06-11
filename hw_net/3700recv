@@ -1,0 +1,166 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+from typing import Union
+SYN = 0
+ACK = 1
+FIN = 2
+packet_flag_dict = {"syn": SYN, "ack": ACK, "fin": FIN}
+
+class Packet:
+    def __init__(self, flag: Union[int, str], seq_num: int, data: bytes):
+
+        # Convert readable flag to int
+        if type(flag) is str:
+            self.flag = packet_flag_dict[flag]
+        else:
+            self.flag = flag
+        self.seq_num = seq_num
+        self.data = data
+        self.check_sum = Packet.calculate_checksum(struct.pack("!bi", self.flag, self.seq_num) + self.data)
+
+    def __str__(self) -> str:
+        return str({"flag": self.flag, "seq_num": self.seq_num, "check_sum": self.check_sum, "data": self.data.decode()})
+
+    def pack(self) -> bytes:
+        return struct.pack("!bii", self.flag, self.seq_num, self.check_sum) + self.data
+
+    @staticmethod
+    def unpack(b_a: bytes) -> 'Packet':
+        try:
+            header = struct.unpack("!bii", b_a[0:9])
+            if header[0] not in [0,1,2] or type(header[1]) is not int or type(header[2]) is not int:
+                raise Exception("error: wrong header")
+            # Check Packet
+            if Packet.calculate_checksum(header[0].to_bytes(1, 'big') + header[1].to_bytes(4, 'big') + b_a[9:]) != header[2]:
+                raise Exception("error: invalid checksum")
+        except Exception as e:
+            # self.log("error: unpack failed: %s" % str(e))
+            return None
+        return Packet(header[0], header[1], b_a[9:])
+
+    @staticmethod
+    def calculate_checksum(content: bytes):
+        # Divide the packet into 16-bit words and calculate the sum
+        if len(content) % 2 != 0:
+            content += b'\x00'  # Pad the packet if the length is not a multiple of 16 bits
+        words = struct.unpack('!%dH' % (len(content) // 2), content)
+        total = sum(words)
+
+        # Add the high 16 bits and low 16 bits of the sum until the high 16 bits become 0
+        while (total >> 16) > 0:
+            total = (total & 0xFFFF) + (total >> 16)
+
+        # Take the complement to get the checksum
+        checksum = ~total & 0xFFFF
+        return checksum
+    
+class RecvWindow:
+    def __init__(self,socket :socket.socket, to_addr: str, to_port: int):
+        # sliding window length
+        self.w_len = 7
+        # sliding window head index
+        self.w_head = 0
+        self.fin_seq = sys.maxsize
+        self.buf_data = [None for _ in self.range_window()]
+        self.socket = socket
+        self.to_addr = to_addr
+        self.to_port = int(to_port)
+        self.fast_retry_dict = dict()
+        
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+    
+    def add_bytes(self, bytes_data: bytes):
+        pkt = Packet.unpack(bytes_data)
+        if pkt is not None:
+            self.log("seq:%d"%pkt.seq_num)
+            self.log("seq_fin:%d" %self.fin_seq)
+            self.log("self.w_head:%d" %self.w_head)
+            self.log("range:" +str(list(self.range_window())) )
+            self.log("buf_len:%d" % len(self.buf_data)  )
+            self.log("buf:" + str([self.buf_data[i] is None for i in self.range_window()]) )
+        
+        if pkt is not None:
+            if pkt.seq_num < self.w_head or pkt.seq_num in self.range_window():
+                self.log("Received message '%s'" % pkt)
+                if pkt.flag is FIN:
+                    self.fin_seq = pkt.seq_num
+                self.buf_data[pkt.seq_num] = pkt.data
+                self.send(Packet(ACK, pkt.seq_num, b''))
+                self.sliding()
+            else:
+                if pkt.seq_num in self.fast_retry_dict:
+                    self.fast_retry_dict[pkt.seq_num] += 1
+                    if self.fast_retry_dict[pkt.seq_num] > 3:
+                        self.fast_retry_syn()
+                else:
+                    self.fast_retry_dict[pkt.seq_num] = 1
+
+    def sliding(self):
+        self.log("recv windows: [head:%d,len:%d]" % (self.w_head,len(self.buf_data)))
+        if None not in self.buf_data[self.w_head : min(self.w_head + self.w_len, self.fin_seq + 1)]:
+            for bytes_data in self.buf_data[self.w_head : min(self.w_head + self.w_len, self.fin_seq + 1)]:
+                if bytes_data != b'':
+                    print(bytes_data.decode("utf-8"), end='', flush=True)
+            self.buf_data += [None for _ in self.range_window()]
+            self.w_head = min(self.w_head + self.w_len, self.fin_seq + 1)
+            self.fast_retry_dict = dict()
+            if self.fin_seq != sys.maxsize:
+                self.fin_seq = sys.maxsize
+
+    def range_window(self):
+        return range(self.w_head, min(self.w_head + self.w_len, self.fin_seq + 1))
+
+    def send(self, pkt: Packet):
+        self.log("Sending message '%s'" % pkt)
+        self.socket.sendto(pkt.pack(), (self.to_addr, self.to_port))
+    
+    def fast_retry_syn(self):
+        for i in self.range_window():
+            if self.buf_data[i] is None:
+                self.send(Packet(SYN, i, b''))
+
+
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        self.remote_host = None
+        self.remote_port = None
+
+        self.recv_window = None
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                bytes_data, addr = conn.recvfrom(65535)
+
+                # Grab the remote host/port if we don't alreadt have it
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+                    self.recv_window = RecvWindow(self.socket, addr[0],addr[1])
+
+                self.recv_window.add_bytes(bytes_data)
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()
+

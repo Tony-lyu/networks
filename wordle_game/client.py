@@ -1,0 +1,244 @@
+import random
+import sys
+import json
+import socket
+import ssl
+
+
+def main(argv):
+    # ./client <-p port> <-s> <hostname> <Northeastern-username>
+    # set default port
+    port = 27993
+    portProvided = False
+    hostname = ""
+    hostnameProvided = False
+    username = "lyu.yun"
+    usernameProvided = False
+    useTLS = False
+    # initialize socket, if useTLS = True, wrap the socket with TLS encoding(this happens after reading commands)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    # message types
+    GUESS = "guess"
+    BYE = "bye"
+    RETRY = "retry"
+    HELLO = "hello"
+    ERROR = "error"
+    START = "start"
+
+    MAX_MESSAGE_SIZE = 10000000
+
+    ###  Reading commandline arguments
+    i = 0
+    while i < len(argv):
+        if i < len(argv) and argv[i] == '-p':
+            port = argv[i+1]
+            i += 2
+            portProvided = True
+        if i < len(argv) and argv[i] == '-s':
+            useTLS = True
+            i+= 1
+            if portProvided == False:
+                port = 27994
+        if i < len(argv):
+            hostname = argv[i]
+            i += 1
+            hostnameProvided = True
+        if i < len(argv) :
+            username = argv[i]
+            i += 1
+            usernameProvided = True
+
+    if hostnameProvided == False or usernameProvided == False:
+        raise Exception("hostname and username must be provided.")
+    
+    # wrap socket with TLS encoding
+    if useTLS:
+        context = ssl.create_default_context()
+        s = context.wrap_socket(s, server_hostname=hostname)
+
+    # prepare for guesses
+    # read words from file, record all words in words, and frequency of all letters in freq
+    words = []
+    freq = [0 for i in range(26)]
+    f = open("3700.network_projects_project1-words.txt", "r")
+    for word in f:
+        words.append(word.strip())
+        for l in word.strip():
+            t = ord(l)-ord('a')
+            freq[ord(l)-ord('a')] += 1
+
+    freq = [(chr(i[0]+ord('a')), i[1]) for i in sorted(enumerate(freq), key=lambda x: x[1])]
+    freq.reverse()
+
+    tries = 0
+
+
+    # say hello to server
+    message = {"type": HELLO, "northeastern_username": username}
+    jsonMessage = json.dumps(message)
+    response = ""
+
+    s.connect((hostname, port))
+    s.sendall(jsonMessage.encode() + b"\n")
+    response = s.recv(MAX_MESSAGE_SIZE).decode()
+
+    id = ""
+    if response == None:
+        print("Got no response from server.")
+        exit(-1)
+    else:
+        response = response.rstrip()
+        message = json.loads(response)
+        if message["type"] == START:
+            id = message["id"]
+        else:
+            print("Didn't get the id, the response is:" , message)
+            exit(-1)
+
+    # create initial guesses containing all 26 letters
+    included_letters = {}
+    my_guesses = []
+    while True:
+        # distinct letters
+        max_dist = 0
+        guess = ""
+        for i in range(len(words)):
+            dist = 0
+            # count new distinct letters in word
+            for l in set(words[i]):
+                if l not in included_letters:
+                    dist += 1
+            # update guess if this word contains more dictinct letters than previous guess
+            if max_dist < dist:
+                guess = words[i]
+                max_dist = dist
+        # no more unselected letters, LET'S GOOOOOOOO!
+        if max_dist == 0:
+            break
+        # add guess to list of guesses
+        my_guesses.append(guess)
+        # update seen letters
+        for l in guess:
+            included_letters[l] = True
+
+
+    secret = [' ' for i in range(5)]
+    # for each letter stores all possible positions in the secret
+    letters_in_secret = {}
+
+    # do first round guessing
+    for i in range(len(my_guesses)):
+        # send the guess
+        type = GUESS
+        # {"type": "guess", "id": "foo", "word": "treat"}\n
+        message = {"type": GUESS, "id": id, "word": "".join(my_guesses[i])}
+        jsonMessage = json.dumps(message)
+
+        tries += 1
+       
+        s.sendall(jsonMessage.encode() + b"\n")
+        response = s.recv(MAX_MESSAGE_SIZE).decode()
+
+
+        # read server response
+        if response == None:
+            print("Got no response from server")
+            exit(-1)
+        else:
+            response = response.rstrip()
+            message = json.loads(response)
+            type = message["type"]
+            if "guesses" in message:
+                marks = message["guesses"][-1]["marks"]
+        # check response type
+        if type == ERROR:
+            print("Got error from server with message:" , message["message"])
+            exit(-1)
+
+        if type == BYE :
+            secret = "".join(my_guesses[i])
+            break
+
+        for j in range(len(my_guesses[i])):
+            # l = the examined letter in position j
+            l = my_guesses[i][j]
+            if marks[j] == 1 :
+                if l in letters_in_secret and j in letters_in_secret[l]:
+                    # remove current place
+                    letters_in_secret[l].remove(j)
+                else:
+                    letters_in_secret[l] = [0,1,2,3,4]
+                    letters_in_secret[l].remove(j)
+            elif marks[j] == 2:
+                secret[j] = l
+                # it is possible that this letter is other places too
+                letters_in_secret[l] = [0, 1, 2, 3, 4]
+
+    # now we know what letters are in the secret word, and we know some positions as well
+    # set up for second round guess
+    my_guesses = []
+    for word in words:
+        possible = True
+        guesses = [""]
+        for j in range(len(word)):
+            l = word[j]
+            if secret[j].isspace() == False:
+                if l == secret[j]:
+                    for k in range(len(guesses)):
+                        guesses[k] += secret[j]
+                else:
+                    possible = False
+                    break
+                continue
+            if l in letters_in_secret:
+                if j in letters_in_secret[l]:
+                    for k in range(len(guesses)):
+                        guesses[k] += l
+                else:
+                    possible = False
+                    break
+            else:
+                possible = False
+                break
+
+        if possible:
+            my_guesses += guesses
+    i = 0
+
+    while True:
+        # send the guess
+        type = GUESS
+        # {"type": "guess", "id": "foo", "word": "treat"}\n
+        tries += 1
+        message = {"type": GUESS, "id": id, "word": my_guesses[i]}
+        jsonMessage = json.dumps(message)
+
+        # marks,type= send_guess(chosen, my_guesses[i])
+
+        s.sendall(jsonMessage.encode() + b"\n")
+        response = s.recv(MAX_MESSAGE_SIZE).decode()
+
+        # read server response
+        response = response.rstrip()
+        message = json.loads(response)
+        type = message["type"]
+        if type == RETRY:
+            # {"type": "retry", "id": "foo", "guesses": [{"word": "treat", "marks": [1, 0, 2, 2, 0]}]}\n
+            pass
+        elif type == BYE:
+            # {"type": "bye", "id": "foo", "flag": "sndk83nb5ks&*dk*SKDFHGk"}\n
+            print(message["flag"])
+            break
+        elif type == ERROR:
+            print("Server send error message, possibly because of too many guesses:" , response)
+            pass
+        else:
+            print(response)
+            break
+        i += 1
+
+
+if __name__ == "__main__":
+   main(sys.argv[1:])
+

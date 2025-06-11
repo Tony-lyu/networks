@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+
+import argparse
+import re
+import socket
+import ssl
+import sys
+from urllib.parse import urljoin
+
+DEFAULT_SERVER = "www.3700.network"
+DEFAULT_PORT = 443
+
+
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        self.cookies = {}
+        self.csrf_token = None
+        self.frontier = set()
+        self.visited = set()
+        self.flags = set()
+        self.socket = None
+
+    def connect(self):
+        self.socket = socket.create_connection((self.server, self.port))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        self.socket = context.wrap_socket(self.socket, server_hostname=self.server)
+
+    def close_connection(self):
+        if self.socket:
+            self.socket.close()
+            self.socket = None
+
+    def send_request(self, path, method="GET", headers=None, body=None, allow_redirects=True):
+        if not self.socket:
+            self.connect()
+
+        request_line = f"{method} {path} HTTP/1.1\r\n"
+        header_lines = f"Host: {self.server}\r\nConnection: keep-alive\r\n"
+
+        if headers:
+            for header, value in headers.items():
+                header_lines += f"{header}: {value}\r\n"
+
+        if self.cookies:
+            cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+            header_lines += f"Cookie: {cookie_str}\r\n"
+
+        if body:
+            header_lines += f"Content-Length: {len(body)}\r\n"
+
+        request = request_line + header_lines + "\r\n" + (body or "")
+        #print(request)
+
+        self.socket.sendall(request.encode('ascii'))
+
+        response = b""
+        content_length = None  # Variable to store the Content-Length header value
+        while True:
+            try:
+                part = self.socket.recv(4096)
+                if not part:
+                    break  # No more data, exit the loop
+                response += part
+
+                # Extract Content-Length header if it's not already done
+                if content_length is None:
+                    match = re.search(r'Content-Length: (\d+)', response.decode('utf-8'), re.IGNORECASE)
+                    if match:
+                        content_length = int(match.group(1))
+
+                # Check if the end of the response has been reached
+                if b"\r\n0\r\n\r\n" in response or (content_length is not None and len(response) >= content_length):
+                    break
+            except socket.timeout:
+                # Handle timeout if necessary
+                break
+
+        data = response.decode('utf-8')
+        #print(f"Response:\n{data}")
+        self.parse_cookies(data)
+
+        # Check if the response is chunked
+        if 'Transfer-Encoding: chunked' in data:
+            try:
+                data = self.handle_chunked_response(data)
+            except ValueError as e:
+                print(f"Error processing chunked response: {e}")
+                return None
+
+        match = re.search(r'HTTP/1\.1 (\d{3})', data)
+        if match:
+            status_code = int(match.group(1))
+            if status_code == 302:
+                location = re.search(r"location: (.+)", data, re.IGNORECASE).group(1).strip()
+                if 'login' in location.lower():
+                    # Fetch the login page to get the CSRF token
+                    self.send_request(location)
+                    csrf_token = self.cookies.get('csrftoken', '')
+                    login_data = f"username={self.username}&password={self.password}&csrfmiddlewaretoken={csrf_token}"
+                    login_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+                    return self.send_request(location, method="POST", headers=login_headers, body=login_data)
+                else:
+                    return self.send_request(location, allow_redirects=allow_redirects)
+            elif status_code in [403, 404]:
+                #print("Abandon URL due to 403 or 404")
+                return None
+            elif status_code == 503:
+                #print("503 - Retrying...")
+                return self.send_request(path, method, headers, body)
+            return data
+        else:
+            print("Failed to find status code in the response.")
+            return None
+
+    def handle_chunked_response(self, response):
+        # Remove HTTP headers
+        header_text, _, body = response.partition('\r\n\r\n')
+
+        # Process each chunk
+        full_data = ''
+        while body:
+            # Find the length of the chunk
+            length_str, _, rest = body.partition('\r\n')
+            try:
+                chunk_length = int(length_str, 16)
+            except ValueError:
+                raise ValueError(f"Invalid chunk length: {length_str}")
+
+            if chunk_length == 0:
+                break  # This is the last chunk
+
+            chunk_data = rest[:chunk_length]
+            full_data += chunk_data
+
+            # Remove the chunk we just processed and the following CRLF
+            body = rest[chunk_length + 2:]
+
+        return header_text + '\r\n\r\n' + full_data
+    def parse_cookies(self, data):
+        lines = data.split('\r\n')
+        for line in lines:
+            if line.lower().startswith("set-cookie:"):
+                cookie_value = line.split(":")[1].split(";")[0].strip()
+                key, value = cookie_value.split("=")
+                if key.lower() == 'csrftoken' or key.lower() == 'sessionid':
+                    self.cookies[key] = value
+
+    def extract_csrf(self, data):
+        # Update this regular expression pattern based on your HTML form
+        match = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)', data)
+        if match:
+            self.csrf_token = match.group(1)
+
+    def find_flags(self, content):
+        #find flags on the page
+        flags = re.findall(r"<h3 class='secret_flag' style=\"color:red\">FLAG: ([\w]+)</h3>", content)
+        for flag in flags:
+            if flag not in self.flags:
+                print(flag)
+                self.flags.add(flag)
+                if len(self.flags) >= 5:  # Check if 5 flags have been found
+                    sys.exit(0)
+    
+    def add_urls(self, content):
+        urls = re.findall(r'href="(/fakebook/[0-9a-zA-Z/]+)"', content)
+        for url in urls:
+            absolute_url = urljoin(f"https://{self.server}", url)
+            if absolute_url not in self.visited and absolute_url not in self.frontier:
+                self.frontier.add(absolute_url)
+    
+    def crawl(self):
+        while self.frontier:
+            path = self.frontier.pop()
+            if path in self.visited:
+                continue
+
+            self.visited.add(path)
+            content = self.send_request(path)
+            if content:
+                self.find_flags(content)
+                self.add_urls(content)
+
+    def run(self):
+        # Initial GET request to Fakebook
+        initial_data = self.send_request("/fakebook/")
+        if initial_data:
+            self.extract_csrf(initial_data)
+            self.frontier.add("/fakebook/")
+            self.crawl()
+        else:
+            print("Failed to fetch the initial page or login failed.")
+        self.close_connection()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
